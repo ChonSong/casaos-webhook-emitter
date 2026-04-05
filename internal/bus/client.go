@@ -9,117 +9,79 @@ import (
 	"net/url"
 	"time"
 
-	"github.com/gorilla/websocket"
+	"nhooyr.io/websocket"
 )
 
-// Event is a CasaOS event received from the MessageBus
 type Event struct {
-	ID        string          `json:"id"`
-	Name      string          `json:"name"`
-	SourceID  string          `json:"source_id"`
-	Timestamp string          `json:"timestamp"`
-	Data      json.RawMessage `json:"data"`
+	SourceID   string            `json:"source_id"`
+	Name       string            `json:"name"`
+	Properties map[string]string `json:"properties"`
+	Timestamp  int64             `json:"timestamp"`
+	UUID       string            `json:"uuid"`
 }
 
-// Client subscribes to CasaOS-MessageBus WebSocket and delivers events to a callback
 type Client struct {
-	baseURL  string
-	token    string
-	dialer   websocket.Dialer
-	mu       chan struct{}
-	conn     *websocket.Conn
-	handler  func(Event)
+	baseURL string
+	token   string
+	handler func(Event)
 }
 
-func NewClient(baseURL, token string) (*Client, error) {
+func NewClient(baseURL, token string) *Client {
 	if baseURL == "" {
 		baseURL = "http://localhost:8080"
 	}
-	return &Client{
-		baseURL: baseURL,
-		token:   token,
-		dialer: websocket.Dialer{
-			HandshakeTimeout: 10 * time.Second,
-		},
-		mu: make(chan struct{}, 1),
-	}, nil
+	return &Client{baseURL: baseURL, token: token}
 }
 
-func (c *Client) OnEvent(handler func(Event)) {
-	c.mu <- struct{}{} // acquire
-	c.handler = handler
-	<-c.mu // release
-}
+func (c *Client) OnEvent(handler func(Event)) { c.handler = handler }
 
 func (c *Client) Subscribe(ctx context.Context, path string) error {
-	u, err := url.Parse(c.baseURL)
-	if err != nil {
-		return fmt.Errorf("parse base url: %w", err)
-	}
+	u, _ := url.Parse(c.baseURL)
 	if u.Scheme == "http" {
 		u.Scheme = "ws"
 	}
 	u.Path = path
-
 	headers := http.Header{}
 	if c.token != "" {
 		headers.Set("Authorization", "Bearer "+c.token)
 	}
-
-	conn, _, err := c.dialer.Dial(u.String(), headers)
+	conn, _, err := websocket.Dial(ctx, u.String(), &websocket.DialOptions{
+		HTTPClient: &http.Client{Timeout: 10 * time.Second},
+		HTTPHeader: headers,
+	})
 	if err != nil {
 		return fmt.Errorf("websocket dial: %w", err)
 	}
-	defer conn.Close()
-
-	c.mu <- struct{}{}
-	c.conn = conn
-	<-c.mu
-
-	log.Printf("[bus] Connected to MessageBus at %s", u.String())
-
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
-			_, msg, err := conn.ReadMessage()
-			if err != nil {
-				if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseNormalClosure) {
-					log.Printf("[bus] WebSocket read error: %v", err)
-				}
-				return err
+	defer conn.Close(websocket.StatusGoingAway, "")
+	log.Printf("[bus] connected to MessageBus at %s", u.String())
+	go func() {
+		tick := time.NewTicker(30 * time.Second)
+		defer tick.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-tick.C:
+				conn.Ping(ctx)
 			}
-			c.handleMessage(msg)
 		}
-	}
-}
-
-func (c *Client) handleMessage(msg []byte) {
-	// Try wrapper format: { "event": { ... } }
-	var wrapper struct {
-		Event Event `json:"event"`
-	}
-	if err := json.Unmarshal(msg, &wrapper); err == nil && wrapper.Event.Name != "" {
-		c.deliver(wrapper.Event)
-		return
-	}
-
-	// Try direct event format
-	var event Event
-	if err := json.Unmarshal(msg, &event); err == nil && event.Name != "" {
-		c.deliver(event)
-		return
-	}
-
-	// Ignore unknown formats (heartbeats, pings, etc.)
-}
-
-func (c *Client) deliver(event Event) {
-	c.mu <- struct{}{}
-	h := c.handler
-	<-c.mu
-	if h != nil {
-		h(event)
+	}()
+	for {
+		_, msg, err := conn.Read(ctx)
+		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			log.Printf("[bus] read error: %v", err)
+			return err
+		}
+		var event Event
+		if err := json.Unmarshal(msg, &event); err != nil {
+			log.Printf("[bus] unmarshal error: %v", err)
+			continue
+		}
+		if c.handler != nil {
+			c.handler(event)
+		}
 	}
 }
