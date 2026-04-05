@@ -15,44 +15,127 @@
 ## Architecture
 
 ```
-CasaOS-MessageBus (WebSocket) 
+CasaOS-MessageBus (WebSocket)
+        │  ws://host:port/v2/message_bus/subscribe/event?source_id=casaos-app-management&names=app:install-begin,...
         │
         ▼
 ┌─────────────────────────┐
 │  Webhook Emitter        │
 │  ┌───────────────────┐  │
-│  │ MessageBus Client │  │  ← Subscribes to event stream
+│  │ MessageBus Client │  │  ← gobwas/ws WebSocket, subscribes to event stream
 │  └─────────┬─────────┘  │
 │            │              │
 │  ┌─────────▼─────────┐  │
-│  │ Webhook Registry  │  │  ← In-memory store + JSON config file
+│  │ Webhook Registry  │  │  ← In-memory + JSON config file
 │  └─────────┬─────────┘  │
 │            │              │
 │  ┌─────────▼─────────┐  │
-│  │ Delivery Engine   │  │  ← HTTP POST with retries, backoff
+│  │ Delivery Engine  │  │  ← HTTP POST with retries, backoff, dead-letter
 │  └───────────────────┘  │
 └─────────────────────────┘
         │
         ▼
-  Registered Webhook URLs (agents, automations)
+  Registered Agent Webhook URLs
 ```
 
 ---
 
 ## Event Sources
 
-### CasaOS-MessageBus (WebSocket)
+### CasaOS-MessageBus WebSocket
 - **Endpoint:** `ws://<message-bus-host>:port/v2/message_bus/subscribe/event`
-- **Protocol:** WebSocket with optional `?names=<event-type>` query filter
-- **Auth:** Bearer token (from CasaOS config)
-- **Events emitted by CasaOS daemon:**
-  - `casaos:system:utilization` — periodic hardware stats
-  - `casaos:file:operate` — file operation events
-  - `casaos:file:recover` — file recovery events
+- **Query params:** `source_id` (required), `names` (optional comma-separated event names)
+- **Protocol:** `gobwas/ws` — text frames carry JSON; ping/pong for keepalive
+- **Auth:** Bearer token via `Authorization` header
+- **Events delivered as binary WebSocket frames:** `wsutil.WriteServerText(conn, message)` in MessageBus source
 
-### CasaOS-AppManagement (future integration)
-- App install/start/stop/uninstall events (endpoint TBD — research to confirm)
-- Likely via same MessageBus or direct Docker events
+### AppManagement Event Catalog (complete, from source)
+
+Source: `CasaOS-AppManagement/common/message.go`
+
+**App lifecycle:**
+| Event Name | Source | Properties |
+|-----------|--------|------------|
+| `app:install-begin` | app-management | `app:name`, `app:icon` |
+| `app:install-progress` | app-management | `app:name`, `app:icon`, `app:progress`, `app:title`, `check_port_conflict`, `dry_run` |
+| `app:install-end` | app-management | `app:name`, `app:icon` |
+| `app:install-error` | app-management | `app:name`, `app:icon`, `message` |
+| `app:uninstall-begin` | app-management | `app:name` |
+| `app:uninstall-end` | app-management | `app:name` |
+| `app:uninstall-error` | app-management | `app:name`, `message` |
+| `app:update-begin` | app-management | — |
+| `app:update-end` | app-management | — |
+| `app:update-error` | app-management | `message` |
+| `app:apply-changes-begin` | app-management | — |
+| `app:apply-changes-end` | app-management | — |
+| `app:apply-changes-error` | app-management | `message` |
+| `app:start-begin` | app-management | `app:name` |
+| `app:start-end` | app-management | `app:name` |
+| `app:start-error` | app-management | `app:name`, `message` |
+| `app:stop-begin` | app-management | `app:name` |
+| `app:stop-end` | app-management | `app:name` |
+| `app:stop-error` | app-management | `app:name`, `message` |
+| `app:restart-begin` | app-management | `app:name` |
+| `app:restart-end` | app-management | `app:name` |
+| `app:restart-error` | app-management | `app:name`, `message` |
+
+**Docker image events:**
+| Event Name | Properties |
+|-----------|------------|
+| `docker:image:pull-begin` | `app:name` |
+| `docker:image:pull-progress` | `app:name`, `message` |
+| `docker:image:pull-end` | `app:name`, `docker:image:updated` |
+| `docker:image:pull-error` | `app:name`, `message` |
+| `docker:image:remove-begin` | `app:name` |
+| `docker:image:remove-end` | `app:name` |
+| `docker:image:remove-error` | `app:name`, `message` |
+
+**Docker container events:**
+| Event Name | Properties |
+|-----------|------------|
+| `docker:container:create-begin` | `docker:container:name` |
+| `docker:container:create-end` | `docker:container:id`, `docker:container:name` |
+| `docker:container:create-error` | `docker:container:name`, `message` |
+| `docker:container:start-begin` | `docker:container:id` |
+| `docker:container:start-end` | `docker:container:id` |
+| `docker:container:start-error` | `docker:container:id`, `message` |
+| `docker:container:stop-begin` | `docker:container:id` |
+| `docker:container:stop-end` | `docker:container:id` |
+| `docker:container:stop-error` | `docker:container:id`, `message` |
+| `docker:container:rename-begin` | `docker:container:id`, `docker:container:name` |
+| `docker:container:rename-end` | `docker:container:id`, `docker:container:name` |
+| `docker:container:rename-error` | `docker:container:id`, `docker:container:name`, `message` |
+| `docker:container:remove-begin` | `docker:container:id` |
+| `docker:container:remove-end` | `docker:container:id` |
+| `docker:container:remove-error` | `docker:container:id`, `message` |
+
+**CasaOS daemon events:**
+| Event Name | Source | Description |
+|-----------|--------|-------------|
+| `casaos:system:utilization` | casaos | Periodic hardware utilization |
+| `casaos:file:operate` | casaos | File operations (copy, move, delete) |
+| `casaos:file:recover` | casaos | File recovery events |
+
+---
+
+## WebSocket Message Format
+
+The MessageBus sends JSON events as binary WebSocket frames:
+
+```json
+{
+  "source_id": "casaos-app-management",
+  "name": "app:install-progress",
+  "properties": {
+    "app:name": "homeassistant/homeassistant",
+    "app:icon": "https://example.com/icon.png",
+    "app:progress": "64",
+    "app:title": "{\"en_us\":\"Home Assistant\"}"
+  },
+  "timestamp": 1743865200,
+  "uuid": "evt_01J9..."
+}
+```
 
 ---
 
@@ -60,29 +143,25 @@ CasaOS-MessageBus (WebSocket)
 
 ### Registration
 Agents register webhooks via:
-1. **CLI:** `casaos-agent webhook register https://agent.example.com/hooks/casaos --event casaos:file:operate`
-2. **Direct HTTP:** `POST /webhooks` with JSON body
+1. **CLI:** `casaos-agent webhook register https://agent.example.com/hooks --event app:install-end`
+2. **Direct HTTP:** `POST http://localhost:9393/webhooks` with JSON body
 3. **File-based:** `webhooks.json` at startup
 
 ### Webhook Record Schema
 ```json
 {
   "id": "wh_01J9...",
-  "url": "https://agent.example.com/hooks/casaos",
-  "events": ["casaos:file:operate", "casaos:system:utilization"],
-  "secret": "optional-hmac-secret",
+  "url": "https://agent.example.com/hooks",
+  "events": ["app:install-end", "app:install-error", "docker:container:stop-end"],
+  "secret": "",
   "created_at": "2026-04-05T17:00:00Z",
-  "enabled": true,
-  "filters": {
-    "exclude_sources": ["casaos:internal:debug"],
-    "match_tags": []
-  }
+  "enabled": true
 }
 ```
 
 ### Registry Persistence
 - Registry stored in `~/.config/casaos-agent/webhooks.json`
-- Hot-reload on file change (inotify or polling)
+- Hot-reload via polling
 
 ---
 
@@ -94,7 +173,7 @@ POST <registered-url> HTTP/1.1
 Host: <from-url>
 Content-Type: application/json
 X-CasaOS-Event: <event-name>
-X-CasaOS-Source: <source-id>
+X-CasaOS-Source: <source_id>
 X-CasaOS-Timestamp: <unix-timestamp>
 X-CasaOS-Delivery-ID: <uuid>
 X-CasaOS-Signature: <hmac-sha256 if secret set>
@@ -104,13 +183,12 @@ X-CasaOS-Signature: <hmac-sha256 if secret set>
 ```json
 {
   "id": "evt_01J9...",
-  "type": "casaos:file:operate",
-  "source": "casaos",
+  "type": "app:install-progress",
+  "source": "casaos-app-management",
   "timestamp": "2026-04-05T17:00:00Z",
-  "data": {
-    "path": "/DATA/foo.txt",
-    "operation": "create",
-    "user": "admin"
+  "properties": {
+    "app:name": "homeassistant/homeassistant",
+    "app:progress": "64"
   }
 }
 ```
@@ -119,20 +197,17 @@ X-CasaOS-Signature: <hmac-sha256 if secret set>
 - **Attempts:** 3
 - **Backoff:** exponential, 1s → 5s → 30s
 - **Timeout:** 10s per request
-- **Success:** HTTP 2xx response
-- **Permanent failure:** HTTP 410 Gone → webhook auto-disabled
-- **Transient failure:** retry with backoff
-- **Dead letter:** Failed deliveries after all retries logged to `~/.local/share/casaos-agent/webhook-emitter/failed deliveries.jsonl`
+- **Success:** HTTP 2xx
+- **Permanent failure:** HTTP 410 → webhook auto-disabled
+- **Dead letter:** `~/.local/share/casaos-agent/webhook-emitter/failed_deliveries.jsonl`
 
 ### Concurrency
 - Max 10 concurrent deliveries
-- Per-webhook rate limit: 60 deliveries/minute (sliding window)
+- Per-webhook rate limit: 60 deliveries/minute
 
 ---
 
-## REST API (for management)
-
-The emitter exposes a local HTTP management port (default `localhost:9393`):
+## REST API (Management Port)
 
 | Method | Path | Description |
 |--------|------|-------------|
@@ -148,13 +223,14 @@ The emitter exposes a local HTTP management port (default `localhost:9393`):
 
 ## Configuration
 
-Config file: `~/.config/casaos-agent/webhook-emitter.yaml`
+`~/.config/casaos-agent/webhook-emitter.yaml`:
 
 ```yaml
 message_bus:
-  url: "http://localhost:8080"  # or UNIX socket path
-  token: ""                     # from CasaOS auth config
+  url: "http://localhost:8080"
+  token: ""
   websocket_path: "/v2/message_bus/subscribe/event"
+  source_id: "casaos-agent"  # source ID we subscribe as
 
 emitter:
   listen: "localhost:9393"
@@ -167,26 +243,7 @@ emitter:
 webhooks:
   config_path: "~/.config/casaos-agent/webhooks.json"
   hot_reload: true
-
-logging:
-  level: "info"  # debug, info, warn, error
-  format: "json"
 ```
-
----
-
-## Operational Modes
-
-### Mode 1: Systemd service (recommended for self-host)
-```
-~/.config/systemd/user/casaos-webhook-emitter.service
-```
-Runs as a user-level systemd service. Auto-restarts on failure.
-
-### Mode 2: Docker sidecar
-Container runs alongside other CasaOS services. Volume mounts:
-- `~/.config/casaos-agent:/config`
-- `~/.local/share/casaos-agent:/data`
 
 ---
 
@@ -194,25 +251,13 @@ Container runs alongside other CasaOS services. Volume mounts:
 
 ```
 casaos-webhook-emitter/
-├── cmd/
-│   └── emitter/
-│       └── main.go
+├── cmd/emitter/main.go
 ├── internal/
-│   ├── bus/           # MessageBus WebSocket client
-│   ├── delivery/      # HTTP delivery engine + retries
-│   ├── registry/      # Webhook registry + persistence
-│   ├── api/           # Management HTTP server
-│   └── config/        # Config file loading
+│   ├── bus/           # MessageBus WebSocket client (gobwas/ws)
+│   ├── delivery/      # HTTP delivery engine + retries + dead-letter
+│   ├── registry/     # Webhook registry + JSON persistence
+│   ├── api/          # Management HTTP server (gorilla/mux)
+│   └── config/       # YAML config loading
 ├── Makefile
-├── README.md
 └── SPEC.md
 ```
-
----
-
-## Out of Scope (Phase 1)
-
-- MQTT or AMQP transport (only HTTP webhooks)
-- Clustering / high availability
--fan-out to more than 100 webhooks per instance
-- Persistent delivery queue (SQLite/Postgres) — in-memory only with dead-letter file
